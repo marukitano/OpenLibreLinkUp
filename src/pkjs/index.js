@@ -191,6 +191,7 @@ function customClay(minified) {
 
 				var defaults = {
 					reversed: false,
+					graphStyle: "points",
 					quickView: false,
 					unit: "mmol",
 					pollIntervalMinutes: 5,
@@ -265,6 +266,7 @@ var KEY_QUICK_VIEW = 17;
 var KEY_LOW_ALARM_THRESHOLD = 18;
 var KEY_HIGH_ALARM_THRESHOLD = 19;
 var KEY_CGM_UNIT = 20;
+var KEY_GRAPH_STYLE = 21;
 
 // LibreLinkUp API endpoints
 var LIBRE_URLS = {
@@ -319,6 +321,7 @@ var settings = {
 	unit: "mgdl",
 	language: "auto",
 	reversed: false,
+	graphStyle: "points",
 	quickView: false,
 	highThreshold: 180,
 	lowThreshold: 80,
@@ -1488,6 +1491,8 @@ function processReadings(readings, fromCache) {
 	message[KEY_ALARM_COLOR] = colorToRgbInt(settings.alarmColor, "0xFF0000");
 	message[KEY_POLL_INTERVAL] = settings.pollIntervalMinutes;
 	message[KEY_REVERSED] = settings.reversed ? 1 : 0;
+	message[KEY_GRAPH_STYLE] =
+		settings.graphStyle === "line" ? 1 : 0;
 	message[KEY_QUICK_VIEW] = settings.quickView ? 1 : 0;
 	message[KEY_NEEDS_SETUP] = 0;
 	message[KEY_SYNC_ERROR] = 0; // Success - no sync error
@@ -1611,6 +1616,8 @@ function sendError(errorText, needsSetup) {
 	message[KEY_CGM_TREND] = 255; // Special value: hide trend icon
 	message[KEY_CGM_TIME_AGO] = 0;
 	message[KEY_NEEDS_SETUP] = needsSetup ? 1 : 0;
+	message[KEY_GRAPH_STYLE] =
+		settings.graphStyle === "line" ? 1 : 0;
 	message[KEY_QUICK_VIEW] = settings.quickView ? 1 : 0;
 	// Signal sync error unless this is just a setup issue
 	message[KEY_SYNC_ERROR] = needsSetup ? 0 : 1;
@@ -1787,6 +1794,7 @@ Pebble.addEventListener("showConfiguration", function (e) {
 		unit: settings.unit,
 		language: settings.language,
 		reversed: settings.reversed,
+		graphStyle: settings.graphStyle,
 		quickView: settings.quickView,
 		lowThresholdMmol: thresholdForSettings(settings.lowThreshold),
 		highThresholdMmol: thresholdForSettings(settings.highThreshold),
@@ -1857,6 +1865,10 @@ Pebble.addEventListener("webviewclosed", function (e) {
 				: "auto";
 	}
 	if (dict.reversed !== undefined) settings.reversed = !!dict.reversed.value;
+	if (dict.graphStyle !== undefined) {
+		settings.graphStyle =
+			dict.graphStyle.value === "line" ? "line" : "points";
+	}
 	if (dict.quickView !== undefined) settings.quickView = !!dict.quickView.value;
 
 	var selectedThresholdUnit =

@@ -239,6 +239,16 @@ module.exports = [
 				defaultValue: false
 			},
 			{
+				type: "select",
+				messageKey: "graphStyle",
+				label: "Diagram",
+				defaultValue: "points",
+				options: [
+					{ label: "Points", value: "points" },
+					{ label: "Line", value: "line" }
+				]
+			},
+			{
 				type: "toggle",
 				messageKey: "quickView",
 				label: "Quick View Color Band",

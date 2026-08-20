@@ -28,6 +28,7 @@
 #define KEY_LOW_ALARM_THRESHOLD 18
 #define KEY_HIGH_ALARM_THRESHOLD 19
 #define KEY_CGM_UNIT     20
+#define KEY_GRAPH_STYLE  21
 
 // Trend arrow indices
 #define TREND_NONE        0
@@ -53,6 +54,10 @@
 #define CHART_LEFT_GUTTER 32   // room for min/max in the same font as hour labels
 #define CHART_EDGE_MARGIN 4
 #define CHART_MIN_SPAN_MGDL 54  // about 3.0 mmol/L
+#define LINE_MAX_GAP_MINUTES 12
+
+#define GRAPH_STYLE_POINTS 0
+#define GRAPH_STYLE_LINE   1
 
 // Display layout constants for Pebble Time 2 (200x228)
 #define SCREEN_WIDTH       200
@@ -62,6 +67,13 @@
 #define CHART_Y            108
 #define CHART_HEIGHT       95
 #define BOTTOM_ROW_Y       196
+
+// Line style: header on top, large graph in the middle, CGM row at the bottom.
+#define LINE_CHART_Y       36
+#define LINE_CHART_HEIGHT  136
+#define LINE_HOUR_LABEL_Y  148
+#define LINE_CGM_ROW_Y     172
+#define LINE_CGM_ROW_HEIGHT 56
 
 // Window and layers
 static Window *s_main_window;
@@ -123,6 +135,10 @@ static GColor s_alarm_color = GColorRed;
 // Display mode (false = white on black, true = black on white)
 static bool s_reversed = false;
 
+// Diagram style. Points keeps the existing layout; Line moves the graph into
+// the middle and the CGM/Quick View row to the bottom.
+static uint8_t s_graph_style = GRAPH_STYLE_POINTS;
+
 // Optional colored background band for fast glucose-status recognition.
 static bool s_quick_view_enabled = false;
 static bool s_quick_view_active = false;
@@ -158,6 +174,7 @@ static void update_quick_view_state(void);
 static void quick_view_layer_update_proc(Layer *layer, GContext *ctx);
 static void trend_layer_update_proc(Layer *layer, GContext *ctx);
 static void update_layout_for_cgm_text(const char *cgm_text);
+static void apply_graph_style_layout(void);
 static void update_time_ago_display(void);
 static void update_date(void);
 static void update_chart_hour_labels(void);
@@ -614,7 +631,10 @@ static void show_data_layers(void) {
     layer_set_hidden(s_chart_layer, false);
     for (int i = 0; i < CHART_DISPLAY_HOURS; i++) {
         if (s_hour_label_layers[i]) {
-            layer_set_hidden(text_layer_get_layer(s_hour_label_layers[i]), false);
+            layer_set_hidden(
+                text_layer_get_layer(s_hour_label_layers[i]),
+                s_graph_style == GRAPH_STYLE_LINE
+            );
         }
     }
     update_quick_view_state();
@@ -997,8 +1017,18 @@ static void trend_layer_update_proc(Layer *layer, GContext *ctx) {
  * Draw the horizontal divider line with 50% dot pattern
  */
 static void divider_layer_update_proc(Layer *layer, GContext *ctx) {
-    // Hide the divider while Quick View covers the CGM area.
-    if (s_quick_view_active) {
+    // Line mode uses the whole space below the header; no divider here.
+    if (s_graph_style == GRAPH_STYLE_LINE) {
+        return;
+    }
+
+    // In Points mode Quick View covers the area directly below this
+    // divider, so hiding the divider gives one clean color band. In Line mode
+    // Quick View lives at the bottom and the header divider stays visible.
+    if (
+        s_quick_view_active &&
+        s_graph_style == GRAPH_STYLE_POINTS
+    ) {
         return;
     }
 
@@ -1010,7 +1040,476 @@ static void divider_layer_update_proc(Layer *layer, GContext *ctx) {
 }
 
 /**
- * Draw the CGM dot chart
+ * Draw the Line style.
+ *
+ * The curve and fill use the glucose category color at every x position.
+ * Fill density fades from newest (right, dense) to oldest (left, sparse).
+ * This is deliberately a horizontal age gradient, not a vertical gradient.
+ */
+/*
+ * Evaluate a cubic Hermite spline at x.
+ *
+ * This is an interpolating spline: it passes through p1 and p2, while the
+ * tangents are derived from neighbouring points p0 and p3. The glucose
+ * measurements are therefore not joined by straight point-to-point segments.
+ */
+static int spline_value_at_x(
+    int x,
+    int x0,
+    int v0,
+    int x1,
+    int v1,
+    int x2,
+    int v2,
+    int x3,
+    int v3
+) {
+    const int Q = 1024;
+    int dx = x2 - x1;
+
+    if (dx <= 0) {
+        return v1;
+    }
+
+    int u = ((x - x1) * Q) / dx;
+    if (u < 0) u = 0;
+    if (u > Q) u = Q;
+
+    int u2 = (u * u) / Q;
+    int u3 = (u2 * u) / Q;
+
+    int h00 = 2 * u3 - 3 * u2 + Q;
+    int h10 = u3 - 2 * u2 + u;
+    int h01 = -2 * u3 + 3 * u2;
+    int h11 = u3 - u2;
+
+    int span_10 = x2 - x0;
+    int span_21 = x3 - x1;
+
+    int tangent1 = 0;
+    int tangent2 = 0;
+
+    if (span_10 != 0) {
+        tangent1 =
+            ((v2 - v0) * dx) / span_10;
+    }
+    if (span_21 != 0) {
+        tangent2 =
+            ((v3 - v1) * dx) / span_21;
+    }
+
+    int64_t result =
+        (int64_t)h00 * v1 +
+        (int64_t)h10 * tangent1 +
+        (int64_t)h01 * v2 +
+        (int64_t)h11 * tangent2;
+
+    if (result >= 0) {
+        result += Q / 2;
+    } else {
+        result -= Q / 2;
+    }
+
+    return (int)(result / Q);
+}
+
+/**
+ * Draw the Line style as a cubic interpolating spline.
+ *
+ * The fill and the top line use the same spline function.
+ * Data gaps larger than LINE_MAX_GAP_MINUTES remain disconnected.
+ */
+static void draw_line_chart(
+    GContext *ctx,
+    GRect bounds,
+    int chart_left,
+    int chart_right,
+    int vertical_margin,
+    int chart_height,
+    int plot_min,
+    int plot_max,
+    const int16_t *values,
+    const uint16_t *minutes_ago,
+    int local_count,
+    int history_elapsed_minutes
+) {
+    if (
+        !values ||
+        !minutes_ago ||
+        local_count < 2 ||
+        plot_max <= plot_min
+    ) {
+        return;
+    }
+
+    int chart_width = chart_right - chart_left;
+    int fill_bottom =
+        bounds.origin.y + vertical_margin + chart_height;
+
+    if (chart_width <= 0) {
+        return;
+    }
+
+    static int point_x[CHART_MAX_POINTS];
+    static int point_y[CHART_MAX_POINTS];
+    static int point_value[CHART_MAX_POINTS];
+    static int point_age[CHART_MAX_POINTS];
+    int point_count = 0;
+
+    // Build points from oldest/left to newest/right.
+    for (int i = local_count - 1; i >= 0; i--) {
+        int age =
+            minutes_ago[i] + history_elapsed_minutes;
+
+        if (
+            age < 0 ||
+            age > CHART_WINDOW_MINUTES
+        ) {
+            continue;
+        }
+
+        int value = values[i];
+        int clamped = value;
+
+        if (clamped < plot_min) clamped = plot_min;
+        if (clamped > plot_max) clamped = plot_max;
+
+        int x = chart_right -
+            (age * chart_width) /
+            CHART_WINDOW_MINUTES;
+
+        int y =
+            bounds.origin.y +
+            vertical_margin +
+            chart_height -
+            ((clamped - plot_min) * chart_height /
+             (plot_max - plot_min));
+
+        if (
+            point_count > 0 &&
+            point_x[point_count - 1] == x
+        ) {
+            point_y[point_count - 1] = y;
+            point_value[point_count - 1] = value;
+            point_age[point_count - 1] = age;
+            continue;
+        }
+
+        point_x[point_count] = x;
+        point_y[point_count] = y;
+        point_value[point_count] = value;
+        point_age[point_count] = age;
+        point_count++;
+
+        if (point_count >= CHART_MAX_POINTS) {
+            break;
+        }
+    }
+
+    if (point_count < 2) {
+        return;
+    }
+
+    int fill_start_x =
+        chart_left + (chart_width / 4);
+    int fill_width =
+        chart_right - fill_start_x;
+    int solid_start =
+        (fill_width * 70) / 100;
+
+    static const uint8_t dither_8x8[8][8] = {
+        {  0, 32,  8, 40,  2, 34, 10, 42 },
+        { 48, 16, 56, 24, 50, 18, 58, 26 },
+        { 12, 44,  4, 36, 14, 46,  6, 38 },
+        { 60, 28, 52, 20, 62, 30, 54, 22 },
+        {  3, 35, 11, 43,  1, 33,  9, 41 },
+        { 51, 19, 59, 27, 49, 17, 57, 25 },
+        { 15, 47,  7, 39, 13, 45,  5, 37 },
+        { 63, 31, 55, 23, 61, 29, 53, 21 }
+    };
+
+    // PASS 1: fill under the spline.
+    for (int i = 0; i < point_count - 1; i++) {
+        int gap =
+            point_age[i] - point_age[i + 1];
+        if (gap < 0) gap = -gap;
+
+        if (gap > LINE_MAX_GAP_MINUTES) {
+            continue;
+        }
+
+        int i0 = i > 0 ? i - 1 : i;
+        int i3 =
+            i + 2 < point_count
+                ? i + 2
+                : i + 1;
+
+        if (i > 0) {
+            int previous_gap =
+                point_age[i - 1] - point_age[i];
+            if (previous_gap < 0) previous_gap = -previous_gap;
+            if (previous_gap > LINE_MAX_GAP_MINUTES) {
+                i0 = i;
+            }
+        }
+
+        if (i + 2 < point_count) {
+            int next_gap =
+                point_age[i + 1] - point_age[i + 2];
+            if (next_gap < 0) next_gap = -next_gap;
+            if (next_gap > LINE_MAX_GAP_MINUTES) {
+                i3 = i + 1;
+            }
+        }
+
+        int x1 = point_x[i];
+        int x2 = point_x[i + 1];
+
+        if (x2 <= x1) {
+            continue;
+        }
+
+        for (int x = x1; x <= x2; x++) {
+            if (
+                x < fill_start_x ||
+                ((x - fill_start_x) & 1) != 0
+            ) {
+                continue;
+            }
+
+            int y = spline_value_at_x(
+                x,
+                point_x[i0],
+                point_y[i0],
+                point_x[i],
+                point_y[i],
+                point_x[i + 1],
+                point_y[i + 1],
+                point_x[i3],
+                point_y[i3]
+            );
+
+            int value = spline_value_at_x(
+                x,
+                point_x[i0],
+                point_value[i0],
+                point_x[i],
+                point_value[i],
+                point_x[i + 1],
+                point_value[i + 1],
+                point_x[i3],
+                point_value[i3]
+            );
+
+#ifdef PBL_COLOR
+            GColor column_color =
+                get_glucose_color(value);
+#else
+            GColor column_color =
+                s_reversed
+                    ? GColorBlack
+                    : GColorWhite;
+#endif
+            graphics_context_set_fill_color(
+                ctx,
+                column_color
+            );
+
+            int fill_relative_x =
+                x - fill_start_x;
+            int density = 1;
+
+            if (fill_width > 0) {
+                if (
+                    fill_relative_x >=
+                    solid_start
+                ) {
+                    density = 64;
+                } else if (solid_start > 0) {
+                    density =
+                        1 +
+                        (fill_relative_x * 63) /
+                        solid_start;
+                }
+            }
+
+            if (density > 64) {
+                density = 64;
+            }
+
+            // Start the 2x2 fill directly underneath/into the 3px spline.
+            // The spline is drawn afterwards, so this overlap is hidden by
+            // the solid line and prevents a visible black gap below it.
+            int first_fill_y = y + 1;
+
+            for (
+                int fill_y = first_fill_y;
+                fill_y <= fill_bottom;
+                fill_y += 2
+            ) {
+                int logical_x =
+                    (x - fill_start_x) / 2;
+                int logical_y =
+                    fill_y / 2;
+
+                uint8_t threshold =
+                    dither_8x8
+                        [logical_y & 7]
+                        [logical_x & 7];
+
+                if (threshold < density) {
+                    graphics_fill_rect(
+                        ctx,
+                        GRect(
+                            x,
+                            fill_y,
+                            2,
+                            2
+                        ),
+                        0,
+                        GCornerNone
+                    );
+                }
+            }
+        }
+    }
+
+    // PASS 2: draw the spline LAST as a clean 3px curve.
+    //
+    // The curve is mathematically defined by spline_value_at_x().
+    // Sampling it once per screen x is only the rasterisation step.
+    for (int i = 0; i < point_count - 1; i++) {
+        int gap =
+            point_age[i] - point_age[i + 1];
+        if (gap < 0) gap = -gap;
+
+        if (gap > LINE_MAX_GAP_MINUTES) {
+            continue;
+        }
+
+        int i0 = i > 0 ? i - 1 : i;
+        int i3 =
+            i + 2 < point_count
+                ? i + 2
+                : i + 1;
+
+        if (i > 0) {
+            int previous_gap =
+                point_age[i - 1] - point_age[i];
+            if (previous_gap < 0) previous_gap = -previous_gap;
+            if (previous_gap > LINE_MAX_GAP_MINUTES) {
+                i0 = i;
+            }
+        }
+
+        if (i + 2 < point_count) {
+            int next_gap =
+                point_age[i + 1] - point_age[i + 2];
+            if (next_gap < 0) next_gap = -next_gap;
+            if (next_gap > LINE_MAX_GAP_MINUTES) {
+                i3 = i + 1;
+            }
+        }
+
+        int x1 = point_x[i];
+        int x2 = point_x[i + 1];
+
+        if (x2 <= x1) {
+            continue;
+        }
+
+        bool have_previous_sample = false;
+        int previous_x = 0;
+        int previous_y = 0;
+
+        for (int x = x1; x <= x2; x++) {
+            int y = spline_value_at_x(
+                x,
+                point_x[i0],
+                point_y[i0],
+                point_x[i],
+                point_y[i],
+                point_x[i + 1],
+                point_y[i + 1],
+                point_x[i3],
+                point_y[i3]
+            );
+
+            int value = spline_value_at_x(
+                x,
+                point_x[i0],
+                point_value[i0],
+                point_x[i],
+                point_value[i],
+                point_x[i + 1],
+                point_value[i + 1],
+                point_x[i3],
+                point_value[i3]
+            );
+
+#ifdef PBL_COLOR
+            GColor line_color =
+                get_glucose_color(value);
+#else
+            GColor line_color =
+                s_reversed
+                    ? GColorBlack
+                    : GColorWhite;
+#endif
+            graphics_context_set_stroke_color(
+                ctx,
+                line_color
+            );
+
+            if (have_previous_sample) {
+                graphics_draw_line(
+                    ctx,
+                    GPoint(
+                        previous_x,
+                        previous_y - 1
+                    ),
+                    GPoint(x, y - 1)
+                );
+                graphics_draw_line(
+                    ctx,
+                    GPoint(
+                        previous_x,
+                        previous_y
+                    ),
+                    GPoint(x, y)
+                );
+                graphics_draw_line(
+                    ctx,
+                    GPoint(
+                        previous_x,
+                        previous_y + 1
+                    ),
+                    GPoint(x, y + 1)
+                );
+            } else {
+                graphics_draw_pixel(
+                    ctx,
+                    GPoint(x, y - 1)
+                );
+                graphics_draw_pixel(
+                    ctx,
+                    GPoint(x, y)
+                );
+                graphics_draw_pixel(
+                    ctx,
+                    GPoint(x, y + 1)
+                );
+            }
+
+            previous_x = x;
+            previous_y = y;
+            have_previous_sample = true;
+        }
+    }
+}
+
+/**
+ * Draw the CGM chart
  */
 static void chart_layer_update_proc(Layer *layer, GContext *ctx) {
     GRect bounds = layer_get_bounds(layer);
@@ -1076,27 +1575,29 @@ static void chart_layer_update_proc(Layer *layer, GContext *ctx) {
 
     // Show the four previous full hours from the left edge through the
     // current time at the right edge. At 20:02 this is 16:00 to 20:02.
-    for (int i = 0; i < CHART_DISPLAY_HOURS; i++) {
-        int minutes_ago = current_minute + (i * 60);
-
-        int x = chart_right -
-                (minutes_ago * chart_width) /
-                CHART_WINDOW_MINUTES;
-
-        // Keep the time scale fixed at four hours. Old grid lines slide out
-        // on the left instead of stretching the whole chart.
-        if (
-            x < bounds.origin.x ||
-            x >= bounds.origin.x + bounds.size.w
-        ) {
-            continue;
-        }
-
-        graphics_draw_line(
-            ctx,
-            GPoint(x, bounds.origin.y + vertical_margin),
-            GPoint(x, bounds.origin.y + vertical_margin + chart_height)
-        );
+    if (s_graph_style == GRAPH_STYLE_POINTS) {
+        for (int i = 0; i < CHART_DISPLAY_HOURS; i++) {
+                int minutes_ago = current_minute + (i * 60);
+        
+                int x = chart_right -
+                        (minutes_ago * chart_width) /
+                        CHART_WINDOW_MINUTES;
+        
+                // Keep the time scale fixed at four hours. Old grid lines slide out
+                // on the left instead of stretching the whole chart.
+                if (
+                    x < bounds.origin.x ||
+                    x >= bounds.origin.x + bounds.size.w
+                ) {
+                    continue;
+                }
+        
+                graphics_draw_line(
+                    ctx,
+                    GPoint(x, bounds.origin.y + vertical_margin),
+                    GPoint(x, bounds.origin.y + vertical_margin + chart_height)
+                );
+            }
     }
 
     if (local_count <= 0) {
@@ -1260,6 +1761,23 @@ static void chart_layer_update_proc(Layer *layer, GContext *ctx) {
             max_mmol_tenths - min_mmol_tenths >= 2U;
     } else {
         show_min_label = raw_max - raw_min >= 4;
+    }
+
+    if (s_graph_style == GRAPH_STYLE_LINE) {
+        draw_line_chart(
+            ctx,
+            bounds,
+            chart_left,
+            chart_right,
+            vertical_margin,
+            chart_height,
+            plot_min,
+            plot_max,
+            values,
+            minutes_ago,
+            local_count,
+            history_elapsed_minutes
+        );
     }
 
     // Draw warning and alarm threshold lines behind the extrema labels.
@@ -1520,6 +2038,10 @@ static void chart_layer_update_proc(Layer *layer, GContext *ctx) {
         }
     }
 
+    if (s_graph_style == GRAPH_STYLE_LINE) {
+        return;
+    }
+
     for (int i = 0; i < local_count; i++) {
         int original_value = values[i];
         int clamped_value = original_value;
@@ -1647,6 +2169,10 @@ static void format_chart_axis_value(int mgdl, char *buffer, size_t size) {
  * Hides delta for LOW/HIGH values since there's no room
  */
 static void update_layout_for_cgm_text(const char *cgm_text) {
+    int row_y =
+        s_graph_style == GRAPH_STYLE_LINE
+            ? LINE_CGM_ROW_Y
+            : CGM_ROW_Y;
 
     // Show CGM value and trend layers (hidden on startup until data arrives)
     layer_set_hidden(text_layer_get_layer(s_cgm_value_layer), false);
@@ -1687,18 +2213,18 @@ static void update_layout_for_cgm_text(const char *cgm_text) {
     // height of "last update" + delta on the right.
     // Nudge the glucose value 5 px to the right for fine alignment.
     layer_set_frame(text_layer_get_layer(s_cgm_value_layer),
-                    GRect(start_x + 10, CGM_ROW_Y - 3, 140, 52));
+                    GRect(start_x + 10, row_y - 3, 140, 52));
 
     // Position trend arrow after CGM text
     int trend_x = start_x + cgm_size.w + gap;
     layer_set_frame(s_trend_layer,
-                    GRect(trend_x, CGM_ROW_Y + 9, 30, 30));
+                    GRect(trend_x, row_y + 9, 30, 30));
 
     // Libre-style glucose unit: clearly readable below the value/arrow block.
     // Keep it left of the separate update/delta block on the right.
     layer_set_frame(
         text_layer_get_layer(s_unit_layer),
-        GRect(trend_x - 10, CGM_ROW_Y + 32, 54, 24)
+        GRect(trend_x - 10, row_y + 32, 54, 24)
     );
 
     // Position the stacked update/delta block after trend
@@ -1708,13 +2234,102 @@ static void update_layout_for_cgm_text(const char *cgm_text) {
         // Keep the right-side mini block visually closer to the right edge,
         // while leaving the whole package slightly more left overall.
         layer_set_frame(text_layer_get_layer(s_time_ago_layer),
-                        GRect(delta_x + 10, CGM_ROW_Y + 2, delta_block_width - 10, 22));
+                        GRect(delta_x + 10, row_y + 2, delta_block_width - 10, 22));
 
         layer_set_frame(s_delta_triangle_layer,
-                        GRect(delta_x + 12, CGM_ROW_Y + 27, 12, 10));
+                        GRect(delta_x + 12, row_y + 27, 12, 10));
 
         layer_set_frame(text_layer_get_layer(s_delta_layer),
-                        GRect(delta_x + 24, CGM_ROW_Y + 21, delta_block_width - 24, 22));
+                        GRect(delta_x + 24, row_y + 21, delta_block_width - 24, 22));
+    }
+}
+
+/**
+ * Apply the layout implied by the selected diagram style.
+ *
+ * Points:
+ *   header -> CGM/Quick View -> chart
+ *
+ * Line:
+ *   header -> large chart -> CGM/Quick View
+ */
+static void apply_graph_style_layout(void) {
+    if (
+        !s_chart_layer ||
+        !s_quick_view_layer ||
+        !s_no_data_layer
+    ) {
+        return;
+    }
+
+    if (s_graph_style == GRAPH_STYLE_LINE) {
+        layer_set_frame(
+            s_chart_layer,
+            GRect(
+                0,
+                LINE_CHART_Y,
+                SCREEN_WIDTH,
+                LINE_CHART_HEIGHT
+            )
+        );
+        layer_set_frame(
+            s_quick_view_layer,
+            GRect(
+                0,
+                LINE_CGM_ROW_Y,
+                SCREEN_WIDTH,
+                LINE_CGM_ROW_HEIGHT
+            )
+        );
+        layer_set_frame(
+            text_layer_get_layer(s_no_data_layer),
+            GRect(
+                0,
+                LINE_CGM_ROW_Y + 12,
+                SCREEN_WIDTH,
+                28
+            )
+        );
+    } else {
+        layer_set_frame(
+            s_chart_layer,
+            GRect(
+                0,
+                CHART_Y,
+                SCREEN_WIDTH,
+                CHART_HEIGHT
+            )
+        );
+        layer_set_frame(
+            s_quick_view_layer,
+            GRect(
+                0,
+                DIVIDER_Y + 1,
+                SCREEN_WIDTH,
+                CHART_Y - DIVIDER_Y - 1
+            )
+        );
+        layer_set_frame(
+            text_layer_get_layer(s_no_data_layer),
+            GRect(
+                0,
+                CGM_ROW_Y + 12,
+                SCREEN_WIDTH,
+                28
+            )
+        );
+    }
+
+    if (s_cgm_value_buffer[0] != '\0') {
+        update_layout_for_cgm_text(s_cgm_value_buffer);
+    }
+
+    update_chart_hour_labels();
+    update_quick_view_state();
+    layer_mark_dirty(s_chart_layer);
+
+    if (s_divider_layer) {
+        layer_mark_dirty(s_divider_layer);
     }
 }
 
@@ -1724,6 +2339,20 @@ static void update_layout_for_cgm_text(const char *cgm_text) {
  * previous full hours, for example 6, 7, 8 when the current hour is 9.
  */
 static void update_chart_hour_labels(void) {
+    // Line mode: hour labels are intentionally hidden.
+    if (s_graph_style == GRAPH_STYLE_LINE) {
+        for (int i = 0; i < CHART_DISPLAY_HOURS; i++) {
+            if (s_hour_label_layers[i]) {
+                layer_set_hidden(
+                    text_layer_get_layer(s_hour_label_layers[i]),
+                    true
+                );
+            }
+        }
+        return;
+    }
+
+
     time_t now = time(NULL);
     struct tm *tick_time = localtime(&now);
 
@@ -1733,6 +2362,10 @@ static void update_chart_hour_labels(void) {
     int chart_right = SCREEN_WIDTH - CHART_EDGE_MARGIN;
     int chart_width = chart_right - chart_left;
     int label_width = 30;
+    int label_y =
+        s_graph_style == GRAPH_STYLE_LINE
+            ? LINE_HOUR_LABEL_Y
+            : BOTTOM_ROW_Y;
 
     // The oldest full hour sits at the left edge and the current time at
     // the right edge. The five labels therefore remain visible together.
@@ -1788,7 +2421,7 @@ static void update_chart_hour_labels(void) {
             text_layer_get_layer(s_hour_label_layers[i]),
             GRect(
                 label_x,
-                BOTTOM_ROW_Y,
+                label_y,
                 label_width,
                 24
             )
@@ -2135,6 +2768,20 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
         if (new_reversed != s_reversed) {
             s_reversed = new_reversed;
             apply_colors();
+        }
+    }
+
+    // Diagram style also selects the matching layout.
+    Tuple *graph_style_tuple = dict_find(iterator, KEY_GRAPH_STYLE);
+    if (graph_style_tuple) {
+        uint8_t new_graph_style =
+            graph_style_tuple->value->uint8 == GRAPH_STYLE_LINE
+                ? GRAPH_STYLE_LINE
+                : GRAPH_STYLE_POINTS;
+
+        if (new_graph_style != s_graph_style) {
+            s_graph_style = new_graph_style;
+            apply_graph_style_layout();
         }
     }
 
