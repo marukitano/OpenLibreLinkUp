@@ -302,6 +302,16 @@ var accountId = null;
 var patientId = null;
 var lastGoodReadingTime = null;
 var pollTimer = null;
+
+// Recovery state.
+// - Ignore duplicate fetch triggers while one request is already running.
+// - Retry failed/stale fetches after one minute.
+// - Force one fresh LibreLinkUp login when the newest server reading is stale.
+var fetchInProgress = false;
+var staleSessionResetDone = false;
+var RETRY_INTERVAL_MINUTES = 1;
+var STALE_REAUTH_MINUTES = 15;
+
 var settings = {
 	accountName: "",
 	password: "",
@@ -1371,6 +1381,7 @@ function processReadings(readings, fromCache) {
 	if (!readings || readings.length === 0) {
 		console.log("No readings received");
 		sendError("No data");
+		scheduleRetry("empty LibreLinkUp response");
 		return;
 	}
 
@@ -1520,7 +1531,26 @@ function processReadings(readings, fromCache) {
 		}
 	);
 
-	// Schedule next poll
+	// A successful HTTP response can still contain an old Libre reading.
+	// Retry quickly, and once per stale episode force a clean LibreLinkUp
+	// session so recovery does not depend on opening/saving settings.
+	if (minutesAgo >= STALE_REAUTH_MINUTES) {
+		console.log(
+			"Newest LibreLinkUp reading is stale (" +
+				minutesAgo +
+				" min old)"
+		);
+
+		if (!staleSessionResetDone) {
+			resetLibreSession("stale LibreLinkUp reading");
+			staleSessionResetDone = true;
+		}
+
+		scheduleRetry("stale LibreLinkUp reading");
+		return;
+	}
+
+	staleSessionResetDone = false;
 	scheduleNextPoll();
 }
 
@@ -1597,6 +1627,20 @@ function sendError(errorText, needsSetup) {
 }
 
 /**
+ * Clear the current LibreLinkUp session.
+ * The next fetch will perform a complete login again.
+ */
+function resetLibreSession(reason) {
+	authToken = null;
+	accountId = null;
+	patientId = null;
+
+	if (reason) {
+		console.log("LibreLinkUp session reset: " + reason);
+	}
+}
+
+/**
  * Main fetch function - authenticate if needed, then fetch data
  */
 function fetchData() {
@@ -1606,55 +1650,99 @@ function fetchData() {
 		return;
 	}
 
-	// If we have a session, try to fetch directly
-	if (authToken) {
-		libreFetchReadings()
-			.then(processReadings)
-			.catch(function (error) {
-				console.log("Fetch failed, re-authenticating: " + error.message);
-				// Session might be expired, try re-auth
-				authToken = null;
-				accountId = null;
-				patientId = null;
-				libreLogin()
-					.then(libreFetchReadings)
-					.then(processReadings)
-					.catch(function (error) {
-						console.log("Re-auth failed: " + error.message);
-						sendError("Auth err");
-					});
-			});
-	} else {
-		// Need to login first
-		libreLogin()
-			.then(libreFetchReadings)
-			.then(processReadings)
-			.catch(function (error) {
-				console.log("Login/fetch failed: " + error.message);
-				if (error.message.indexOf("401") >= 0 || error.message.indexOf("500") >= 0) {
-					sendError("Auth err");
-				} else {
-					sendError("Net err");
-				}
-			});
+	// The watch tick and the JS timer can request data at nearly the same time.
+	// Do not run overlapping login/graph requests.
+	if (fetchInProgress) {
+		console.log("Fetch already in progress; ignoring duplicate request");
+		return;
 	}
+
+	fetchInProgress = true;
+
+	var request;
+
+	if (authToken) {
+		request = libreFetchReadings().catch(function (error) {
+			console.log(
+				"Fetch failed, re-authenticating: " +
+					error.message
+			);
+			resetLibreSession("fetch failed");
+			return libreLogin().then(libreFetchReadings);
+		});
+	} else {
+		request = libreLogin().then(libreFetchReadings);
+	}
+
+	request
+		.then(function (readings) {
+			fetchInProgress = false;
+			processReadings(readings);
+		})
+		.catch(function (error) {
+			fetchInProgress = false;
+			console.log(
+				"Login/fetch failed after recovery attempt: " +
+					error.message
+			);
+
+			resetLibreSession("request failed");
+
+			if (
+				error.message.indexOf("401") >= 0 ||
+				error.message.indexOf("500") >= 0
+			) {
+				sendError("Auth err");
+			} else {
+				sendError("Net err");
+			}
+
+			scheduleRetry(error.message);
+		});
 }
 
 /**
- * Schedule the next LibreLinkUp poll using the configured interval.
+ * Schedule a fetch and replace any older pending timer.
  */
-function scheduleNextPoll() {
+function schedulePollIn(minutes, label) {
 	if (pollTimer) {
 		clearTimeout(pollTimer);
 		pollTimer = null;
 	}
 
+	if (minutes < 1) {
+		minutes = 1;
+	}
+
+	console.log(
+		(label || "Next poll") +
+			" in " +
+			minutes +
+			" minute(s)"
+	);
+	pollTimer = setTimeout(fetchData, minutes * 60 * 1000);
+}
+
+/**
+ * Retry quickly after a transient network/auth/stale-data problem.
+ */
+function scheduleRetry(reason) {
+	console.log(
+		"Scheduling recovery retry" +
+			(reason ? ": " + reason : "")
+	);
+	schedulePollIn(RETRY_INTERVAL_MINUTES, "Recovery retry");
+}
+
+/**
+ * Schedule the next normal LibreLinkUp poll using the configured interval.
+ */
+function scheduleNextPoll() {
 	var minutes = parseInt(settings.pollIntervalMinutes, 10) || 5;
 	if (minutes < 1) minutes = 1;
 	if (minutes > 10) minutes = 10;
 
-	console.log("Next poll in " + minutes + " minute(s)");
-	pollTimer = setTimeout(fetchData, minutes * 60 * 1000);
+	schedulePollIn(minutes, "Next poll");
 }
 
 /**
@@ -1860,10 +1948,10 @@ Pebble.addEventListener("webviewclosed", function (e) {
 	saveSettings();
 	logCurrentColorDefaults();
 
-	// Reset session on credential change
-	authToken = null;
-	accountId = null;
-	patientId = null;
+	// Re-open with a clean LibreLinkUp session, even when the user only
+	// saved the existing settings. This remains a useful manual recovery path.
+	resetLibreSession("configuration saved");
+	staleSessionResetDone = false;
 
 	// Fetch data with new settings
 	fetchData();
