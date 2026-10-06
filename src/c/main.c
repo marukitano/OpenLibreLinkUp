@@ -53,7 +53,8 @@
 #define CHART_DISPLAY_HOURS 5  // four previous full hours plus the current hour
 #define CHART_LEFT_GUTTER 32   // room for min/max in the same font as hour labels
 #define CHART_EDGE_MARGIN 4
-#define CHART_MIN_SPAN_MGDL 54  // about 3.0 mmol/L
+#define CHART_MIN_SPAN_MGDL 54  // about 3.0 mmol/L (Points)
+#define LINE_CHART_MIN_SPAN_MGDL 90  // about 5.0 mmol/L (Line)
 #define LINE_MAX_GAP_MINUTES 12
 
 #define GRAPH_STYLE_POINTS 0
@@ -1661,8 +1662,13 @@ static void chart_layer_update_proc(Layer *layer, GContext *ctx) {
     // The chart remains dynamic, but never zooms in below about 3.0 mmol/L.
     int plot_span = plot_max - plot_min;
 
-    if (plot_span < CHART_MIN_SPAN_MGDL) {
-        int missing_span = CHART_MIN_SPAN_MGDL - plot_span;
+    int minimum_plot_span =
+        s_graph_style == GRAPH_STYLE_LINE
+            ? LINE_CHART_MIN_SPAN_MGDL
+            : CHART_MIN_SPAN_MGDL;
+
+    if (plot_span < minimum_plot_span) {
+        int missing_span = minimum_plot_span - plot_span;
         int extend_below = missing_span / 2;
         int extend_above = missing_span - extend_below;
 
