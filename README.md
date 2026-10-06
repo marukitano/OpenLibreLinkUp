@@ -1,10 +1,9 @@
 # OpenLibreLinkUp
 
 <p align="center">
-  <img src="docs/store-preview-v2.jpg" alt="OpenLibreLinkUp on Pebble Time 2" width="600">
+  <img src="docs/store-preview-v3.jpg" alt="OpenLibreLinkUp on Pebble Time 2" width="600">
 </p>
 
-![](./OpenLibreLinkUp.png)    ![](OpenLibreLinkUp2.png)    ![](OpenLibreLinkUp4.png)    ![](OpenLibreLinkUp3.png)
 
 > [Deutsche Version](#deutsche-version)
 
