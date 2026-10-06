@@ -1,7 +1,7 @@
 # OpenLibreLinkUp
 
 <p align="center">
-  <img src="docs/store-preview-v3.jpg" alt="OpenLibreLinkUp on Pebble Time 2" width="600">
+  <img src="docs/openlibrelinkup.png" alt="OpenLibreLinkUp on Pebble Time 2" width="600">
 </p>
 
 
